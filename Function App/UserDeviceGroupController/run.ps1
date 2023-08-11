@@ -123,6 +123,7 @@ function Remove-AzureADGroupMembership {
 # Version control
 # 2022-09-20 - Version 1.0.0
 # 2023-07-09 - Version 1.1.0
+# 2023-08-09 - Version 1.2.0
 
 # Import AzTable module
 Write-Information -MessageData "Importing required modules"
@@ -164,7 +165,14 @@ try {
 
                         # Get existing device members
                         $DeviceGroupCurrentMembers = Get-AzureADGroupMembership -GroupID $TableEntity.DeviceGroupID
-                        $DeviceGroupCurrentMembersCount = ($DeviceGroupCurrentMembers | Measure-Object).Count
+                        
+                        # Calculate the number of members in the device group depending on the return value
+                        if ($DeviceGroupCurrentMembers.PSObject.Properties -match "value") {
+                            $DeviceGroupCurrentMembersCount = ($DeviceGroupCurrentMembers.value | Measure-Object).Count
+                        }
+                        else {
+                            $DeviceGroupCurrentMembersCount = ($DeviceGroupCurrentMembers | Measure-Object).Count
+                        }
                         Write-Information -MessageData "- Current device group members count: $($DeviceGroupCurrentMembersCount)"
 
                         # Process each user identity and get devices for mapping
@@ -232,13 +240,34 @@ try {
                         # Filter registered devices by managed state, management authority and operating system
                         $UserRegisteredDevices = $UserRegisteredDevices | Where-Object { ($PSItem.operatingSystem -eq "Windows") -and ($PSItem.isManaged -eq $true) -and ($PSItem.managementType -eq "MDM") }
 
+                        # Calculate count for user registered devices prior to any filtering
+                        $UserRegisteredDevicesCount = ($UserRegisteredDevices | Measure-Object).Count
+                        Write-Information -MessageData "- Retrieved registered devices count: $($UserRegisteredDevicesCount)"
+
                         # Filter registered devices for compliance if required
                         if ($TableEntity.IsCompliant -eq $true) {
-                            $UserRegisteredDevicesCount = ($UserRegisteredDevices | Measure-Object).Count
                             $UserRegisteredDevices = $UserRegisteredDevices | Where-Object { $PSItem.isCompliant -eq $true }
                             
                             # Output non-compliant device count
                             Write-Information -MessageData "- Non-compliant device count: $($UserRegisteredDevicesCount - $UserRegisteredDevices.Count)"
+                        }
+
+                        # Filter registered devices for enrollment profile name if required
+                        if ($TableEntity.PSObject.Properties -match "EnrollmentProfileName") {
+                            if (-not([string]::IsNullOrEmpty($TableEntity.EnrollmentProfileName))) {
+                                # Split enrollment profile names into array
+                                $EnrollmentProfileNames = $TableEntity.EnrollmentProfileName.Split(";")
+                                
+                                # Construct enrollment profile names string for output and regular expression matching
+                                $EnrollmentProfileNamesString = $EnrollmentProfileNames -join "|"
+                                Write-Information -MessageData "- Filtering registered devices for enrollment profile name: $($EnrollmentProfileNames -join ", ")"
+
+                                # Filter registered devices for enrollment profile name
+                                $UserRegisteredDevices = $UserRegisteredDevices | Where-Object { $PSItem.enrollmentProfileName -match $EnrollmentProfileNamesString }
+
+                                # Output non-matching enrollment profile name count
+                                Write-Information -MessageData "- Non-matching enrollment profile name count: $($UserRegisteredDevicesCount - $UserRegisteredDevices.Count)"
+                            }
                         }
 
                         # Process each user registered device and add to device directory object list
@@ -280,8 +309,13 @@ try {
                             }
                             
                             # Add each device group member reference to difference hash table
-                            foreach ($DeviceGroupCurrentMember in $DeviceGroupCurrentMembers) {
-                                $DeviceGroupDifferenceHash.Add($DeviceGroupCurrentMember.id, $null)
+                            if ($DeviceGroupCurrentMembersCount -ge 1) {
+                                foreach ($DeviceGroupCurrentMember in $DeviceGroupCurrentMembers) {
+                                    $DeviceGroupDifferenceHash.Add($DeviceGroupCurrentMember.id, $null)
+                                }
+                            }
+                            else {
+                                $DeviceGroupDifferenceHash.Add("NoMembers", $null)
                             }
 
                             # Remove each device directory object reference from reference hash table if it exists in difference hash table (removes duplicates)
@@ -350,21 +384,26 @@ try {
                             }
 
                             # Remove existing device group members if required
-                            if ($DeviceGroupDifferenceHash.Keys.Count -ge 1) {
-                                # Cleanup device group members if required
-                                Write-Information -MessageData "- Device group cleanup is required, as '$($DeviceGroupDifferenceHash.Keys.Count)' members are not part of the new device directory object list"
-                                Write-Information -MessageData "- Removing device group memberships with count: $($DeviceGroupDifferenceHash.Keys.Count)"
-                                foreach ($DeviceGroupDifferenceHashItem in $DeviceGroupDifferenceHash.Keys) {
-                                    try {
-                                        $Response = Remove-AzureADGroupMembership -GroupID $TableEntity.DeviceGroupID -ObjectID $DeviceGroupDifferenceHashItem -ErrorAction "Stop"
-                                    }
-                                    catch [System.Exception] {
-                                        Write-Warning -Message "Failed to remove device group member '$($DeviceGroupDifferenceHashItem)' from '$($TableEntity.DeviceGroupName)' with error message: $($_.Exception.Message)"
-                                    }
-                                }
+                            if ($DeviceGroupDifferenceHash.ContainsKey("NoMembers")) {
+                                Write-Information -MessageData "- Device group cleanup is not required, as it contains no members"
                             }
                             else {
-                                Write-Information -MessageData "- Device group cleanup is not required, as all existing members are part of the new device directory object list"
+                                if ($DeviceGroupDifferenceHash.Keys.Count -ge 1) {
+                                    # Cleanup device group members if required
+                                    Write-Information -MessageData "- Device group cleanup is required, as '$($DeviceGroupDifferenceHash.Keys.Count)' members are not part of the new device directory object list"
+                                    Write-Information -MessageData "- Removing device group memberships with count: $($DeviceGroupDifferenceHash.Keys.Count)"
+                                    foreach ($DeviceGroupDifferenceHashItem in $DeviceGroupDifferenceHash.Keys) {
+                                        try {
+                                            $Response = Remove-AzureADGroupMembership -GroupID $TableEntity.DeviceGroupID -ObjectID $DeviceGroupDifferenceHashItem -ErrorAction "Stop"
+                                        }
+                                        catch [System.Exception] {
+                                            Write-Warning -Message "Failed to remove device group member '$($DeviceGroupDifferenceHashItem)' from '$($TableEntity.DeviceGroupName)' with error message: $($_.Exception.Message)"
+                                        }
+                                    }
+                                }
+                                else {
+                                    Write-Information -MessageData "- Device group cleanup is not required, as all existing members are part of the new device directory object list"
+                                }
                             }
                         }
                         else {
@@ -376,7 +415,7 @@ try {
                     }
                 }
                 catch [System.Exception] {
-                    Write-Warning -Message "Failed to retrieve group memberships for table entity '$($TableEntity.UserGroupName)' with error message: $($_.Exception.Message)"
+                    Write-Warning -Message "Failed to retrieve group memberships for user group '$($TableEntity.UserGroupName)' with error message: $($_.Exception.Message)"
                 }
             }
             else {
